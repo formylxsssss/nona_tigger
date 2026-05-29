@@ -1,7 +1,7 @@
 speed 2400
 si swd
 connect
-loadfile build/pulse_send.hex
+loadfile build/sona_tigger.hex
 r
 g
 qc
