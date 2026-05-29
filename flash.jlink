@@ -1,0 +1,7 @@
+speed 2400
+si swd
+connect
+loadfile build/pulse_send.hex
+r
+g
+qc
