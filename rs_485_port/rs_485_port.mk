@@ -1,4 +1,4 @@
-RS_485_PORT_SRC = rs_485_port/rs485_modbus.c\
+RS_485_PORT_SRC = rs_485_port/rs485_control.c\
 
 
 # Required include directories

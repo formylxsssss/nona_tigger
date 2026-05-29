@@ -18,18 +18,9 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "i2c.h"
-#include "spi.h"
-#include "string.h"
 #include "usart.h"
-#include "stdint.h"
-#include "tim.h"
 #include "gpio.h"
-#include "pulse_out.h"
-#include "rs485_modbus.h"
-#include "SEGGER_RTT.h"
-#include "tm1650.h"
-#include "display_logic.h"
+#include "rs485_control.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -92,17 +83,9 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_I2C1_Init();
   MX_USART2_UART_Init();
-  MX_TIM4_Init();
-  HAL_Delay(200);
-  TM1650_Init();
-  PulseOut_Init();
-  DisplayLogic_Init();
-  RS485_MB_Init(&huart2);
-  RS485_MB_StartReceiveIT();
-  HAL_Delay(1000);
-  myprintf("init success\n");
+  RS485_Control_Init(&huart2);
+  RS485_Control_StartReceiveIT();
   /* USER CODE BEGIN 2 */
   /* USER CODE END 2 */
 
@@ -111,9 +94,7 @@ int main(void)
   while (1)
   {
 
-   
-    RS485_MB_Poll();
-    DisplayLogic_Task();
+    RS485_Control_Poll();
     /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
   }

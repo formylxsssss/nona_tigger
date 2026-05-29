@@ -20,16 +20,10 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32f1xx_it.h"
-#include "tim.h"
 #include "usart.h"
-#include "SEGGER_RTT.h"
-#include "pulse_out.h"
-#include "rs485_modbus.h"
+#include "rs485_control.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#ifndef myprintf
-#define myprintf(...) SEGGER_RTT_printf(0, __VA_ARGS__)
-#endif
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -63,7 +57,6 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-extern TIM_HandleTypeDef htim4;
 
 /* USER CODE BEGIN EV */
 
@@ -144,25 +137,11 @@ void PendSV_Handler(void)
 {
 }
 
-void TIM4_IRQHandler(void)
-{
-    HAL_TIM_IRQHandler(&htim4);
-}
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance == TIM4)
-    {
-
-
-    }
-}
-
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2)
     {
-      RS485_MB_RxCpltCallback(huart);
+      RS485_Control_RxCpltCallback(huart);
     }
 }
 
@@ -183,7 +162,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2)
     {
-        RS485_MB_ErrorCallback(huart);
+        RS485_Control_ErrorCallback(huart);
     }
 }
 

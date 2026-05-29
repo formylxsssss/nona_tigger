@@ -20,8 +20,6 @@ ALLCSRC =
 ALLINC =
 include ARM_SEGGER_RTT/segger_rtt.mk
 include rs_485_port/rs_485_port.mk
-include pulse_out/pulse_out.mk
-include SENSOR/sensor.mk
 ######################################
 # building variables
 ######################################
@@ -44,27 +42,20 @@ BUILD_DIR = build
 C_SOURCES =  \
 Core/Src/main.c \
 Core/Src/gpio.c \
-Core/Src/i2c.c \
-Core/Src/spi.c \
-Core/Src/tim.c \
 Core/Src/usart.c \
 Core/Src/stm32f1xx_it.c \
 Core/Src/stm32f1xx_hal_msp.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_gpio_ex.c \
-Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_i2c.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rcc.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_rcc_ex.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_gpio.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_dma.c \
-Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_tim.c \
-Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_tim_ex.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_cortex.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_pwr.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_flash.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_flash_ex.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_exti.c \
-Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_spi.c \
 Drivers/STM32F1xx_HAL_Driver/Src/stm32f1xx_hal_uart.c \
 Core/Src/system_stm32f1xx.c \
 

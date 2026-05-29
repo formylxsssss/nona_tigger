@@ -51,9 +51,7 @@ extern "C" {
 
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
-extern volatile uint8_t sensor_flag;
 /* USER CODE BEGIN EFP */
-void sensor_send_task(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
