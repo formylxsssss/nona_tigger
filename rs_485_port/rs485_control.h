@@ -18,9 +18,31 @@ extern "C" {
 #define TRIGGER_OE_PIN                   GPIO_PIN_6
 #define TRIGGER_OE_ACTIVE_LEVEL          GPIO_PIN_RESET
 
-#define RS485_CTRL_RX_LINE_MAX_LEN       64U
+#define RS485_CTRL_HEADER_0              0xAAU
+#define RS485_CTRL_HEADER_1              0x55U
+#define RS485_CTRL_MAX_DATA_LEN          16U
+#define RS485_CTRL_FRAME_OVERHEAD        5U
+#define RS485_CTRL_MAX_FRAME_LEN         (RS485_CTRL_MAX_DATA_LEN + 2U + RS485_CTRL_FRAME_OVERHEAD)
 #define RS485_CTRL_DEFAULT_PULSE_MS      100U
 #define RS485_CTRL_DEFAULT_INTERVAL_SEC  5U
+
+#define RS485_CTRL_CMD_SET_MODE          0x01U
+#define RS485_CTRL_CMD_SET_INTERVAL      0x02U
+#define RS485_CTRL_CMD_SET_PULSE         0x03U
+#define RS485_CTRL_CMD_START             0x04U
+#define RS485_CTRL_CMD_STOP              0x05U
+#define RS485_CTRL_CMD_TRIGGER           0x06U
+#define RS485_CTRL_CMD_GET_STATUS        0x07U
+
+#define RS485_CTRL_MODE_VALUE_AUTO       0x00U
+#define RS485_CTRL_MODE_VALUE_TRIGGER    0x01U
+
+#define RS485_CTRL_RES_OK                0x00U
+#define RS485_CTRL_RES_ERR_CMD           0x01U
+#define RS485_CTRL_RES_ERR_LEN           0x02U
+#define RS485_CTRL_RES_ERR_PARAM         0x03U
+#define RS485_CTRL_RES_ERR_BUSY          0x04U
+#define RS485_CTRL_RES_ERR_MODE          0x05U
 
 typedef enum
 {

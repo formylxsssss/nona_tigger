@@ -1,7 +1,4 @@
 #include "rs485_control.h"
-#include <ctype.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 typedef struct
@@ -19,22 +16,27 @@ static UART_HandleTypeDef *s_huart = NULL;
 static RS485_ControlState_t s_state;
 
 static volatile uint8_t s_rx_byte = 0U;
-static volatile char s_rx_line[RS485_CTRL_RX_LINE_MAX_LEN];
-static volatile uint16_t s_rx_len = 0U;
-static volatile uint8_t s_line_ready = 0U;
-static char s_pending_line[RS485_CTRL_RX_LINE_MAX_LEN];
+static volatile uint8_t s_rx_buf[RS485_CTRL_MAX_FRAME_LEN];
+static volatile uint8_t s_rx_len = 0U;
+static volatile uint8_t s_rx_expect_len = 0U;
+static volatile uint8_t s_frame_ready = 0U;
+static volatile uint32_t s_last_rx_tick = 0U;
+static uint8_t s_pending_frame[RS485_CTRL_MAX_FRAME_LEN];
+static uint8_t s_pending_len = 0U;
 
 static void RS485_Control_SetTxMode(void);
 static void RS485_Control_SetRxMode(void);
-static void RS485_Control_SendText(const char *text);
-static void RS485_Control_SendLine(const char *prefix, const char *text);
-static void RS485_Control_ProcessLine(char *line);
+static void RS485_Control_ResetParser(void);
+static void RS485_Control_TryCompleteFrame(void);
+static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len);
+static void RS485_Control_SendResponse(uint8_t cmd, uint8_t result, const uint8_t *data, uint8_t data_len);
 static void RS485_Control_TriggerOutput(void);
 static void RS485_Control_StopAuto(void);
 static void RS485_Control_StartAuto(void);
-static void RS485_Control_FormatStatus(char *buf, uint16_t len);
-static char *RS485_Control_Trim(char *s);
-static int RS485_Control_TokenEquals(const char *a, const char *b);
+static uint16_t RS485_Control_Crc16(const uint8_t *data, uint16_t len);
+static uint16_t RS485_Control_ReadU16LE(const uint8_t *p);
+static void RS485_Control_WriteU16LE(uint8_t *p, uint16_t v);
+static void RS485_Control_WriteU32LE(uint8_t *p, uint32_t v);
 
 HAL_StatusTypeDef RS485_Control_Init(UART_HandleTypeDef *huart)
 {
@@ -66,10 +68,9 @@ HAL_StatusTypeDef RS485_Control_Init(UART_HandleTypeDef *huart)
     s_state.pulse_started_tick = 0U;
     s_state.next_auto_tick = 0U;
 
-    s_rx_len = 0U;
-    s_line_ready = 0U;
-    memset(s_pending_line, 0, sizeof(s_pending_line));
-
+    s_frame_ready = 0U;
+    s_pending_len = 0U;
+    RS485_Control_ResetParser();
     RS485_Control_SetRxMode();
 
     return HAL_OK;
@@ -96,28 +97,49 @@ void RS485_Control_RxCpltCallback(UART_HandleTypeDef *huart)
 
     b = s_rx_byte;
 
-    if (s_line_ready == 0U)
+    if (s_frame_ready == 0U)
     {
-        if ((b == '\r') || (b == '\n'))
+        if ((s_rx_len == 0U) && (b != RS485_CTRL_HEADER_0))
         {
-            if (s_rx_len > 0U)
+            (void)HAL_UART_Receive_IT(s_huart, (uint8_t *)&s_rx_byte, 1U);
+            return;
+        }
+
+        if ((s_rx_len == 1U) && (b != RS485_CTRL_HEADER_1))
+        {
+            s_rx_len = (b == RS485_CTRL_HEADER_0) ? 1U : 0U;
+            s_rx_buf[0] = b;
+            (void)HAL_UART_Receive_IT(s_huart, (uint8_t *)&s_rx_byte, 1U);
+            return;
+        }
+
+        if (s_rx_len < RS485_CTRL_MAX_FRAME_LEN)
+        {
+            s_rx_buf[s_rx_len++] = b;
+            s_last_rx_tick = HAL_GetTick();
+
+            if (s_rx_len == 3U)
             {
-                s_rx_line[s_rx_len] = '\0';
-                memcpy(s_pending_line, (const void *)s_rx_line, s_rx_len + 1U);
-                s_line_ready = 1U;
-                s_rx_len = 0U;
+                uint8_t len = s_rx_buf[2];
+
+                if ((len == 0U) || (len > (RS485_CTRL_MAX_DATA_LEN + 1U)))
+                {
+                    RS485_Control_ResetParser();
+                }
+                else
+                {
+                    s_rx_expect_len = (uint8_t)(len + RS485_CTRL_FRAME_OVERHEAD);
+                }
+            }
+
+            if ((s_rx_expect_len > 0U) && (s_rx_len == s_rx_expect_len))
+            {
+                RS485_Control_TryCompleteFrame();
             }
         }
-        else if ((b >= 0x20U) && (b <= 0x7EU))
+        else
         {
-            if (s_rx_len < (RS485_CTRL_RX_LINE_MAX_LEN - 1U))
-            {
-                s_rx_line[s_rx_len++] = (char)b;
-            }
-            else
-            {
-                s_rx_len = 0U;
-            }
+            RS485_Control_ResetParser();
         }
     }
 
@@ -131,15 +153,21 @@ void RS485_Control_ErrorCallback(UART_HandleTypeDef *huart)
         return;
     }
 
-    s_rx_len = 0U;
+    RS485_Control_ResetParser();
     __HAL_UART_CLEAR_PEFLAG(s_huart);
     (void)HAL_UART_Receive_IT(s_huart, (uint8_t *)&s_rx_byte, 1U);
 }
 
 void RS485_Control_Poll(void)
 {
-    char line[RS485_CTRL_RX_LINE_MAX_LEN];
+    uint8_t frame[RS485_CTRL_MAX_FRAME_LEN];
+    uint8_t frame_len;
     uint32_t now = HAL_GetTick();
+
+    if ((s_rx_len > 0U) && ((uint32_t)(now - s_last_rx_tick) > 50U))
+    {
+        RS485_Control_ResetParser();
+    }
 
     if ((s_state.pulse_active != 0U) &&
         ((uint32_t)(now - s_state.pulse_started_tick) >= s_state.pulse_width_ms))
@@ -157,148 +185,192 @@ void RS485_Control_Poll(void)
         s_state.next_auto_tick = now + s_state.interval_ms;
     }
 
-    if (s_line_ready == 0U)
+    if (s_frame_ready == 0U)
     {
         return;
     }
 
     __disable_irq();
-    strncpy(line, s_pending_line, sizeof(line) - 1U);
-    line[sizeof(line) - 1U] = '\0';
-    s_pending_line[0] = '\0';
-    s_line_ready = 0U;
+    frame_len = s_pending_len;
+    if (frame_len > RS485_CTRL_MAX_FRAME_LEN)
+    {
+        frame_len = RS485_CTRL_MAX_FRAME_LEN;
+    }
+    memcpy(frame, s_pending_frame, frame_len);
+    s_frame_ready = 0U;
+    s_pending_len = 0U;
     __enable_irq();
 
-    RS485_Control_ProcessLine(line);
+    RS485_Control_ProcessFrame(frame, frame_len);
 }
 
-static void RS485_Control_ProcessLine(char *line)
+static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len)
 {
-    char *cmd;
-    char *arg;
+    uint8_t len;
+    uint8_t cmd;
+    const uint8_t *data;
+    uint8_t data_len;
+    uint8_t tx_data[16];
+    uint8_t tx_len = 0U;
+    uint8_t result = RS485_CTRL_RES_OK;
 
-    line = RS485_Control_Trim(line);
-    if (*line == '\0')
+    if ((frame == NULL) || (frame_len < RS485_CTRL_FRAME_OVERHEAD + 1U))
     {
         return;
     }
 
-    cmd = strtok(line, " \t");
-    arg = strtok(NULL, " \t");
+    len = frame[2];
+    cmd = frame[3];
+    data = &frame[4];
+    data_len = (uint8_t)(len - 1U);
 
-    if (cmd == NULL)
+    switch (cmd)
     {
-        return;
+        case RS485_CTRL_CMD_SET_MODE:
+        {
+            if (data_len != 1U)
+            {
+                result = RS485_CTRL_RES_ERR_LEN;
+            }
+            else if (data[0] == RS485_CTRL_MODE_VALUE_AUTO)
+            {
+                s_state.mode = RS485_CTRL_MODE_AUTO;
+                result = RS485_CTRL_RES_OK;
+            }
+            else if (data[0] == RS485_CTRL_MODE_VALUE_TRIGGER)
+            {
+                RS485_Control_StopAuto();
+                s_state.mode = RS485_CTRL_MODE_TRIGGER;
+                result = RS485_CTRL_RES_OK;
+            }
+            else
+            {
+                result = RS485_CTRL_RES_ERR_PARAM;
+            }
+        } break;
+
+        case RS485_CTRL_CMD_SET_INTERVAL:
+        {
+            uint16_t sec;
+
+            if (data_len != 2U)
+            {
+                result = RS485_CTRL_RES_ERR_LEN;
+            }
+            else
+            {
+                sec = RS485_Control_ReadU16LE(data);
+                if (sec == 0U)
+                {
+                    result = RS485_CTRL_RES_ERR_PARAM;
+                }
+                else
+                {
+                    s_state.interval_ms = (uint32_t)sec * 1000U;
+                    result = RS485_CTRL_RES_OK;
+                }
+            }
+        } break;
+
+        case RS485_CTRL_CMD_SET_PULSE:
+        {
+            uint16_t ms;
+
+            if (data_len != 2U)
+            {
+                result = RS485_CTRL_RES_ERR_LEN;
+            }
+            else
+            {
+                ms = RS485_Control_ReadU16LE(data);
+                if ((ms == 0U) || (ms > 60000U))
+                {
+                    result = RS485_CTRL_RES_ERR_PARAM;
+                }
+                else
+                {
+                    s_state.pulse_width_ms = ms;
+                    result = RS485_CTRL_RES_OK;
+                }
+            }
+        } break;
+
+        case RS485_CTRL_CMD_START:
+        {
+            if (data_len != 0U)
+            {
+                result = RS485_CTRL_RES_ERR_LEN;
+            }
+            else if (s_state.mode != RS485_CTRL_MODE_AUTO)
+            {
+                result = RS485_CTRL_RES_ERR_MODE;
+            }
+            else
+            {
+                RS485_Control_StartAuto();
+                result = RS485_CTRL_RES_OK;
+            }
+        } break;
+
+        case RS485_CTRL_CMD_STOP:
+        {
+            if (data_len != 0U)
+            {
+                result = RS485_CTRL_RES_ERR_LEN;
+            }
+            else
+            {
+                RS485_Control_StopAuto();
+                result = RS485_CTRL_RES_OK;
+            }
+        } break;
+
+        case RS485_CTRL_CMD_TRIGGER:
+        {
+            if (data_len != 0U)
+            {
+                result = RS485_CTRL_RES_ERR_LEN;
+            }
+            else if (s_state.mode != RS485_CTRL_MODE_TRIGGER)
+            {
+                result = RS485_CTRL_RES_ERR_MODE;
+            }
+            else if (s_state.pulse_active != 0U)
+            {
+                result = RS485_CTRL_RES_ERR_BUSY;
+            }
+            else
+            {
+                RS485_Control_TriggerOutput();
+                result = RS485_CTRL_RES_OK;
+            }
+        } break;
+
+        case RS485_CTRL_CMD_GET_STATUS:
+        {
+            if (data_len != 0U)
+            {
+                result = RS485_CTRL_RES_ERR_LEN;
+            }
+            else
+            {
+                tx_data[0] = (s_state.mode == RS485_CTRL_MODE_AUTO) ? RS485_CTRL_MODE_VALUE_AUTO : RS485_CTRL_MODE_VALUE_TRIGGER;
+                tx_data[1] = s_state.auto_running;
+                tx_data[2] = s_state.pulse_active;
+                RS485_Control_WriteU32LE(&tx_data[3], s_state.interval_ms / 1000U);
+                RS485_Control_WriteU32LE(&tx_data[7], s_state.pulse_width_ms);
+                tx_len = 11U;
+                result = RS485_CTRL_RES_OK;
+            }
+        } break;
+
+        default:
+        {
+            result = RS485_CTRL_RES_ERR_CMD;
+        } break;
     }
 
-    if (RS485_Control_TokenEquals(cmd, "MODE") != 0)
-    {
-        if (arg == NULL)
-        {
-            RS485_Control_SendLine("ERR ", "MODE PARAM\r\n");
-        }
-        else if (RS485_Control_TokenEquals(arg, "AUTO") != 0)
-        {
-            s_state.mode = RS485_CTRL_MODE_AUTO;
-            RS485_Control_SendLine("OK ", "MODE AUTO\r\n");
-        }
-        else if ((RS485_Control_TokenEquals(arg, "TRIGGER") != 0) ||
-                 (RS485_Control_TokenEquals(arg, "TRIG") != 0))
-        {
-            RS485_Control_StopAuto();
-            s_state.mode = RS485_CTRL_MODE_TRIGGER;
-            RS485_Control_SendLine("OK ", "MODE TRIGGER\r\n");
-        }
-        else
-        {
-            RS485_Control_SendLine("ERR ", "MODE PARAM\r\n");
-        }
-    }
-    else if (RS485_Control_TokenEquals(cmd, "INTERVAL") != 0)
-    {
-        uint32_t sec;
-
-        if (arg == NULL)
-        {
-            RS485_Control_SendLine("ERR ", "INTERVAL PARAM\r\n");
-            return;
-        }
-
-        sec = (uint32_t)strtoul(arg, NULL, 10);
-        if ((sec == 0U) || (sec > 86400U))
-        {
-            RS485_Control_SendLine("ERR ", "INTERVAL RANGE\r\n");
-            return;
-        }
-
-        s_state.interval_ms = sec * 1000U;
-        RS485_Control_SendLine("OK ", "INTERVAL\r\n");
-    }
-    else if (RS485_Control_TokenEquals(cmd, "PULSE") != 0)
-    {
-        uint32_t ms;
-
-        if (arg == NULL)
-        {
-            RS485_Control_SendLine("ERR ", "PULSE PARAM\r\n");
-            return;
-        }
-
-        ms = (uint32_t)strtoul(arg, NULL, 10);
-        if ((ms == 0U) || (ms > 60000U))
-        {
-            RS485_Control_SendLine("ERR ", "PULSE RANGE\r\n");
-            return;
-        }
-
-        s_state.pulse_width_ms = ms;
-        RS485_Control_SendLine("OK ", "PULSE\r\n");
-    }
-    else if (RS485_Control_TokenEquals(cmd, "START") != 0)
-    {
-        if (s_state.mode != RS485_CTRL_MODE_AUTO)
-        {
-            RS485_Control_SendLine("ERR ", "NOT AUTO\r\n");
-        }
-        else
-        {
-            RS485_Control_StartAuto();
-            RS485_Control_SendLine("OK ", "START\r\n");
-        }
-    }
-    else if (RS485_Control_TokenEquals(cmd, "STOP") != 0)
-    {
-        RS485_Control_StopAuto();
-        RS485_Control_SendLine("OK ", "STOP\r\n");
-    }
-    else if ((RS485_Control_TokenEquals(cmd, "TRIG") != 0) ||
-             (RS485_Control_TokenEquals(cmd, "TRIGGER") != 0))
-    {
-        if (s_state.mode != RS485_CTRL_MODE_TRIGGER)
-        {
-            RS485_Control_SendLine("ERR ", "NOT TRIGGER MODE\r\n");
-        }
-        else if (s_state.pulse_active != 0U)
-        {
-            RS485_Control_SendLine("ERR ", "BUSY\r\n");
-        }
-        else
-        {
-            RS485_Control_TriggerOutput();
-            RS485_Control_SendLine("OK ", "TRIG\r\n");
-        }
-    }
-    else if (RS485_Control_TokenEquals(cmd, "STATUS") != 0)
-    {
-        char status[96];
-
-        RS485_Control_FormatStatus(status, sizeof(status));
-        RS485_Control_SendText(status);
-    }
-    else
-    {
-        RS485_Control_SendLine("ERR ", "CMD\r\n");
-    }
+    RS485_Control_SendResponse(cmd, result, tx_data, tx_len);
 }
 
 static void RS485_Control_TriggerOutput(void)
@@ -320,18 +392,69 @@ static void RS485_Control_StopAuto(void)
     s_state.auto_running = 0U;
 }
 
-static void RS485_Control_FormatStatus(char *buf, uint16_t len)
+static void RS485_Control_ResetParser(void)
 {
-    const char *mode = (s_state.mode == RS485_CTRL_MODE_AUTO) ? "AUTO" : "TRIGGER";
-    uint32_t interval_sec = s_state.interval_ms / 1000U;
+    s_rx_len = 0U;
+    s_rx_expect_len = 0U;
+    s_last_rx_tick = HAL_GetTick();
+}
 
-    (void)snprintf(buf, len,
-                   "STATUS MODE=%s RUN=%u INTERVAL=%lus PULSE=%lums BUSY=%u\r\n",
-                   mode,
-                   (unsigned int)s_state.auto_running,
-                   (unsigned long)interval_sec,
-                   (unsigned long)s_state.pulse_width_ms,
-                   (unsigned int)s_state.pulse_active);
+static void RS485_Control_TryCompleteFrame(void)
+{
+    uint16_t crc_calc;
+    uint16_t crc_recv;
+    uint8_t total_len = s_rx_expect_len;
+
+    crc_calc = RS485_Control_Crc16((const uint8_t *)s_rx_buf, (uint16_t)(total_len - 2U));
+    crc_recv = RS485_Control_ReadU16LE((const uint8_t *)&s_rx_buf[total_len - 2U]);
+
+    if ((crc_calc == crc_recv) && (s_frame_ready == 0U))
+    {
+        memcpy(s_pending_frame, (const void *)s_rx_buf, total_len);
+        s_pending_len = total_len;
+        s_frame_ready = 1U;
+    }
+
+    RS485_Control_ResetParser();
+}
+
+static void RS485_Control_SendResponse(uint8_t cmd, uint8_t result, const uint8_t *data, uint8_t data_len)
+{
+    uint8_t tx_buf[RS485_CTRL_MAX_FRAME_LEN];
+    uint8_t payload_len;
+    uint8_t total_len;
+    uint16_t crc;
+
+    if ((s_huart == NULL) || (data_len > RS485_CTRL_MAX_DATA_LEN))
+    {
+        return;
+    }
+
+    payload_len = (uint8_t)(2U + data_len);
+    total_len = (uint8_t)(payload_len + RS485_CTRL_FRAME_OVERHEAD);
+
+    tx_buf[0] = RS485_CTRL_HEADER_0;
+    tx_buf[1] = RS485_CTRL_HEADER_1;
+    tx_buf[2] = payload_len;
+    tx_buf[3] = (uint8_t)(cmd | 0x80U);
+    tx_buf[4] = result;
+
+    if ((data != NULL) && (data_len > 0U))
+    {
+        memcpy(&tx_buf[5], data, data_len);
+    }
+
+    crc = RS485_Control_Crc16(tx_buf, (uint16_t)(total_len - 2U));
+    RS485_Control_WriteU16LE(&tx_buf[total_len - 2U], crc);
+
+    RS485_Control_SetTxMode();
+    (void)HAL_UART_Transmit(s_huart, tx_buf, total_len, 1000U);
+
+    while (__HAL_UART_GET_FLAG(s_huart, UART_FLAG_TC) == RESET)
+    {
+    }
+
+    RS485_Control_SetRxMode();
 }
 
 static void RS485_Control_SetTxMode(void)
@@ -344,71 +467,52 @@ static void RS485_Control_SetRxMode(void)
     HAL_GPIO_WritePin(RS485_CTRL_DE_GPIO_PORT, RS485_CTRL_DE_PIN, GPIO_PIN_RESET);
 }
 
-static void RS485_Control_SendText(const char *text)
+static uint16_t RS485_Control_Crc16(const uint8_t *data, uint16_t len)
 {
-    uint16_t len;
+    uint16_t crc = 0xFFFFU;
+    uint16_t i;
+    uint8_t j;
 
-    if ((s_huart == NULL) || (text == NULL))
+    if (data == NULL)
     {
-        return;
+        return 0xFFFFU;
     }
 
-    len = (uint16_t)strlen(text);
-
-    RS485_Control_SetTxMode();
-    (void)HAL_UART_Transmit(s_huart, (uint8_t *)text, len, 1000U);
-
-    while (__HAL_UART_GET_FLAG(s_huart, UART_FLAG_TC) == RESET)
+    for (i = 0U; i < len; i++)
     {
-    }
-
-    RS485_Control_SetRxMode();
-}
-
-static void RS485_Control_SendLine(const char *prefix, const char *text)
-{
-    char buf[RS485_CTRL_RX_LINE_MAX_LEN + 8U];
-
-    if ((prefix == NULL) || (text == NULL))
-    {
-        return;
-    }
-
-    (void)snprintf(buf, sizeof(buf), "%s%s", prefix, text);
-    RS485_Control_SendText(buf);
-}
-
-static char *RS485_Control_Trim(char *s)
-{
-    char *end;
-
-    while ((*s != '\0') && isspace((unsigned char)*s))
-    {
-        s++;
-    }
-
-    end = s + strlen(s);
-    while ((end > s) && isspace((unsigned char)*(end - 1)))
-    {
-        end--;
-    }
-    *end = '\0';
-
-    return s;
-}
-
-static int RS485_Control_TokenEquals(const char *a, const char *b)
-{
-    while ((*a != '\0') && (*b != '\0'))
-    {
-        if (toupper((unsigned char)*a) != toupper((unsigned char)*b))
+        crc ^= data[i];
+        for (j = 0U; j < 8U; j++)
         {
-            return 0;
+            if ((crc & 0x0001U) != 0U)
+            {
+                crc >>= 1U;
+                crc ^= 0xA001U;
+            }
+            else
+            {
+                crc >>= 1U;
+            }
         }
-
-        a++;
-        b++;
     }
 
-    return ((*a == '\0') && (*b == '\0')) ? 1 : 0;
+    return crc;
+}
+
+static uint16_t RS485_Control_ReadU16LE(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static void RS485_Control_WriteU16LE(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFU);
+    p[1] = (uint8_t)((v >> 8) & 0xFFU);
+}
+
+static void RS485_Control_WriteU32LE(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFU);
+    p[1] = (uint8_t)((v >> 8) & 0xFFU);
+    p[2] = (uint8_t)((v >> 16) & 0xFFU);
+    p[3] = (uint8_t)((v >> 24) & 0xFFU);
 }
