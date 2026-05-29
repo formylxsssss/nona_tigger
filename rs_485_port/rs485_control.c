@@ -1,4 +1,5 @@
 #include "rs485_control.h"
+#include "SEGGER_RTT.h"
 #include <string.h>
 
 typedef struct
@@ -21,6 +22,8 @@ static volatile uint8_t s_rx_len = 0U;
 static volatile uint8_t s_rx_expect_len = 0U;
 static volatile uint8_t s_frame_ready = 0U;
 static volatile uint32_t s_last_rx_tick = 0U;
+static volatile uint16_t s_crc_error_count = 0U;
+static volatile uint16_t s_drop_count = 0U;
 static uint8_t s_pending_frame[RS485_CTRL_MAX_FRAME_LEN];
 static uint8_t s_pending_len = 0U;
 
@@ -37,6 +40,7 @@ static uint16_t RS485_Control_Crc16(const uint8_t *data, uint16_t len);
 static uint16_t RS485_Control_ReadU16LE(const uint8_t *p);
 static void RS485_Control_WriteU16LE(uint8_t *p, uint16_t v);
 static void RS485_Control_WriteU32LE(uint8_t *p, uint32_t v);
+static const char *RS485_Control_ModeName(RS485_ControlMode_t mode);
 
 HAL_StatusTypeDef RS485_Control_Init(UART_HandleTypeDef *huart)
 {
@@ -70,8 +74,15 @@ HAL_StatusTypeDef RS485_Control_Init(UART_HandleTypeDef *huart)
 
     s_frame_ready = 0U;
     s_pending_len = 0U;
+    s_crc_error_count = 0U;
+    s_drop_count = 0U;
     RS485_Control_ResetParser();
     RS485_Control_SetRxMode();
+
+    myprintf("[RS485] init ok, PA4 low=RX high=TX, mode=%s, interval=%us, pulse=%ums\r\n",
+             RS485_Control_ModeName(s_state.mode),
+             (unsigned int)(s_state.interval_ms / 1000U),
+             (unsigned int)s_state.pulse_width_ms);
 
     return HAL_OK;
 }
@@ -124,6 +135,7 @@ void RS485_Control_RxCpltCallback(UART_HandleTypeDef *huart)
 
                 if ((len == 0U) || (len > (RS485_CTRL_MAX_DATA_LEN + 1U)))
                 {
+                    s_drop_count++;
                     RS485_Control_ResetParser();
                 }
                 else
@@ -139,6 +151,7 @@ void RS485_Control_RxCpltCallback(UART_HandleTypeDef *huart)
         }
         else
         {
+            s_drop_count++;
             RS485_Control_ResetParser();
         }
     }
@@ -163,9 +176,25 @@ void RS485_Control_Poll(void)
     uint8_t frame[RS485_CTRL_MAX_FRAME_LEN];
     uint8_t frame_len;
     uint32_t now = HAL_GetTick();
+    static uint16_t last_crc_error_count = 0U;
+    static uint16_t last_drop_count = 0U;
+
+    if (last_crc_error_count != s_crc_error_count)
+    {
+        last_crc_error_count = s_crc_error_count;
+        myprintf("[RS485] crc error count=%u\r\n", (unsigned int)last_crc_error_count);
+    }
+
+    if (last_drop_count != s_drop_count)
+    {
+        last_drop_count = s_drop_count;
+        myprintf("[RS485] dropped frame count=%u\r\n", (unsigned int)last_drop_count);
+    }
 
     if ((s_rx_len > 0U) && ((uint32_t)(now - s_last_rx_tick) > 50U))
     {
+        s_drop_count++;
+        myprintf("[RS485] rx timeout, parser reset\r\n");
         RS485_Control_ResetParser();
     }
 
@@ -174,6 +203,7 @@ void RS485_Control_Poll(void)
     {
         HAL_GPIO_WritePin(TRIGGER_OUT_GPIO_PORT, TRIGGER_OUT_PIN, GPIO_PIN_RESET);
         s_state.pulse_active = 0U;
+        myprintf("[TRIG] pulse end, PA5=0\r\n");
     }
 
     if ((s_state.mode == RS485_CTRL_MODE_AUTO) &&
@@ -200,6 +230,10 @@ void RS485_Control_Poll(void)
     s_frame_ready = 0U;
     s_pending_len = 0U;
     __enable_irq();
+
+    myprintf("[RS485] rx frame len=%u cmd=0x%02X\r\n",
+             (unsigned int)frame_len,
+             (unsigned int)frame[3]);
 
     RS485_Control_ProcessFrame(frame, frame_len);
 }
@@ -236,12 +270,14 @@ static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len)
             {
                 s_state.mode = RS485_CTRL_MODE_AUTO;
                 result = RS485_CTRL_RES_OK;
+                myprintf("[CMD] set mode AUTO\r\n");
             }
             else if (data[0] == RS485_CTRL_MODE_VALUE_TRIGGER)
             {
                 RS485_Control_StopAuto();
                 s_state.mode = RS485_CTRL_MODE_TRIGGER;
                 result = RS485_CTRL_RES_OK;
+                myprintf("[CMD] set mode TRIGGER\r\n");
             }
             else
             {
@@ -268,6 +304,7 @@ static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len)
                 {
                     s_state.interval_ms = (uint32_t)sec * 1000U;
                     result = RS485_CTRL_RES_OK;
+                    myprintf("[CMD] set interval=%us\r\n", (unsigned int)sec);
                 }
             }
         } break;
@@ -291,6 +328,7 @@ static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len)
                 {
                     s_state.pulse_width_ms = ms;
                     result = RS485_CTRL_RES_OK;
+                    myprintf("[CMD] set pulse=%ums\r\n", (unsigned int)ms);
                 }
             }
         } break;
@@ -309,6 +347,7 @@ static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len)
             {
                 RS485_Control_StartAuto();
                 result = RS485_CTRL_RES_OK;
+                myprintf("[CMD] auto start\r\n");
             }
         } break;
 
@@ -322,6 +361,7 @@ static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len)
             {
                 RS485_Control_StopAuto();
                 result = RS485_CTRL_RES_OK;
+                myprintf("[CMD] auto stop\r\n");
             }
         } break;
 
@@ -343,6 +383,7 @@ static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len)
             {
                 RS485_Control_TriggerOutput();
                 result = RS485_CTRL_RES_OK;
+                myprintf("[CMD] trigger once\r\n");
             }
         } break;
 
@@ -361,6 +402,12 @@ static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len)
                 RS485_Control_WriteU32LE(&tx_data[7], s_state.pulse_width_ms);
                 tx_len = 11U;
                 result = RS485_CTRL_RES_OK;
+                myprintf("[CMD] status mode=%s run=%u busy=%u interval=%us pulse=%ums\r\n",
+                         RS485_Control_ModeName(s_state.mode),
+                         (unsigned int)s_state.auto_running,
+                         (unsigned int)s_state.pulse_active,
+                         (unsigned int)(s_state.interval_ms / 1000U),
+                         (unsigned int)s_state.pulse_width_ms);
             }
         } break;
 
@@ -368,6 +415,13 @@ static void RS485_Control_ProcessFrame(const uint8_t *frame, uint8_t frame_len)
         {
             result = RS485_CTRL_RES_ERR_CMD;
         } break;
+    }
+
+    if (result != RS485_CTRL_RES_OK)
+    {
+        myprintf("[CMD] cmd=0x%02X result=0x%02X\r\n",
+                 (unsigned int)cmd,
+                 (unsigned int)result);
     }
 
     RS485_Control_SendResponse(cmd, result, tx_data, tx_len);
@@ -379,17 +433,20 @@ static void RS485_Control_TriggerOutput(void)
     s_state.pulse_active = 1U;
     HAL_GPIO_WritePin(TRIGGER_OE_GPIO_PORT, TRIGGER_OE_PIN, TRIGGER_OE_ACTIVE_LEVEL);
     HAL_GPIO_WritePin(TRIGGER_OUT_GPIO_PORT, TRIGGER_OUT_PIN, GPIO_PIN_SET);
+    myprintf("[TRIG] pulse start, PA5=1 width=%ums\r\n", (unsigned int)s_state.pulse_width_ms);
 }
 
 static void RS485_Control_StartAuto(void)
 {
     s_state.auto_running = 1U;
     s_state.next_auto_tick = HAL_GetTick();
+    myprintf("[AUTO] start interval=%us\r\n", (unsigned int)(s_state.interval_ms / 1000U));
 }
 
 static void RS485_Control_StopAuto(void)
 {
     s_state.auto_running = 0U;
+    myprintf("[AUTO] stop\r\n");
 }
 
 static void RS485_Control_ResetParser(void)
@@ -413,6 +470,14 @@ static void RS485_Control_TryCompleteFrame(void)
         memcpy(s_pending_frame, (const void *)s_rx_buf, total_len);
         s_pending_len = total_len;
         s_frame_ready = 1U;
+    }
+    else if (crc_calc != crc_recv)
+    {
+        s_crc_error_count++;
+    }
+    else
+    {
+        s_drop_count++;
     }
 
     RS485_Control_ResetParser();
@@ -447,6 +512,11 @@ static void RS485_Control_SendResponse(uint8_t cmd, uint8_t result, const uint8_
     crc = RS485_Control_Crc16(tx_buf, (uint16_t)(total_len - 2U));
     RS485_Control_WriteU16LE(&tx_buf[total_len - 2U], crc);
 
+    myprintf("[RS485] tx response cmd=0x%02X result=0x%02X len=%u, PA4=1 TX\r\n",
+             (unsigned int)tx_buf[3],
+             (unsigned int)result,
+             (unsigned int)total_len);
+
     RS485_Control_SetTxMode();
     (void)HAL_UART_Transmit(s_huart, tx_buf, total_len, 1000U);
 
@@ -455,6 +525,7 @@ static void RS485_Control_SendResponse(uint8_t cmd, uint8_t result, const uint8_
     }
 
     RS485_Control_SetRxMode();
+    myprintf("[RS485] tx done, PA4=0 RX\r\n");
 }
 
 static void RS485_Control_SetTxMode(void)
@@ -515,4 +586,9 @@ static void RS485_Control_WriteU32LE(uint8_t *p, uint32_t v)
     p[1] = (uint8_t)((v >> 8) & 0xFFU);
     p[2] = (uint8_t)((v >> 16) & 0xFFU);
     p[3] = (uint8_t)((v >> 24) & 0xFFU);
+}
+
+static const char *RS485_Control_ModeName(RS485_ControlMode_t mode)
+{
+    return (mode == RS485_CTRL_MODE_AUTO) ? "AUTO" : "TRIGGER";
 }

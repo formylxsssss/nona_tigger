@@ -13,7 +13,7 @@
 ######################################
 # target
 ######################################
-TARGET = pulse_send
+TARGET = sona_tigger
 
 
 ALLCSRC =
